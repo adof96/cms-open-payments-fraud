@@ -1,0 +1,28 @@
+# Entorno virtual
+.venvcl/
+
+# Python
+__pycache__/
+*.pyc
+
+# Datos (conservar la estructura de carpetas vía .gitkeep)
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/cms_open_payments/
+!data/raw/leie/
+data/raw/cms_open_payments/*
+!data/raw/cms_open_payments/.gitkeep
+data/raw/leie/*
+!data/raw/leie/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Modelos entrenados
+models/*.pkl
+
+# IDE
+.vscode/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
