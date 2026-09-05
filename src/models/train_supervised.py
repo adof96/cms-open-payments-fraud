@@ -267,6 +267,43 @@ def preprocess_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame):
     return train_out, test_out, artifacts
 
 
+def apply_preprocessing(raw_df: pd.DataFrame, artifacts: dict) -> pd.DataFrame:
+    """Complemento de solo-transform de preprocess_features: aplica un preprocesamiento
+    YA AJUSTADO (p.ej. cargado desde models/supervised_preprocessing.pkl) a un
+    DataFrame crudo, sin volver a ajustar nada. Para reutilizar un modelo ya entrenado
+    sobre datos nuevos, o para reconstruir X_test sin reentrenar (ver
+    src/models/tune_threshold.py).
+    """
+    out = pd.DataFrame(index=raw_df.index)
+
+    out["payment_amount_log"] = raw_df["payment_amount_log"].astype("float32")
+    out["num_payments_included"] = raw_df["num_payments_included"].astype("float32")
+    out["payment_month"] = raw_df["payment_month"].astype("float32")
+    out["payment_day_of_week"] = raw_df["payment_day_of_week"].astype("float32")
+    out["is_related_product"] = raw_df["is_related_product"].astype("int8")
+    out["is_third_party_payment"] = raw_df["is_third_party_payment"].astype("int8")
+
+    freq_median = artifacts["payment_frequency_median"]
+    out["payment_frequency_missing"] = raw_df["payment_frequency"].isna().astype("int8")
+    out["payment_frequency"] = raw_df["payment_frequency"].fillna(freq_median).astype("float32")
+
+    for col in TARGET_ENCODED_COLUMNS:
+        mapping = artifacts["target_encoding"][col]["mapping"]
+        global_mean = artifacts["target_encoding"][col]["global_mean"]
+        filled = raw_df[col].fillna("Missing")
+        out[f"{col}_te"] = _apply_target_encoding(filled, mapping, global_mean)
+
+    for col in BUCKET_COLUMNS:
+        keep = set(artifacts["bucket_categories"][col])
+        bucketed = _apply_rare_category_bucket(raw_df[col], keep)
+        dummies = pd.get_dummies(bucketed, prefix=col, dtype="int8")
+        expected_cols = [c for c in artifacts["feature_columns"] if c.startswith(f"{col}_")]
+        dummies = dummies.reindex(columns=expected_cols, fill_value=0)
+        out = pd.concat([out, dummies], axis=1)
+
+    return out[artifacts["feature_columns"]]
+
+
 def _evaluate(model, X_test: pd.DataFrame, y_test: pd.Series, label: str) -> dict:
     y_pred = model.predict(X_test)
     y_proba = model.predict_proba(X_test)[:, 1]
