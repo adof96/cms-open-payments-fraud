@@ -16,6 +16,11 @@ data/raw/leie/*
 !data/raw/leie/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+# dashboard_summary.json es chico (134KB) y streamlit_app/app.py lo necesita en runtime
+# - a diferencia del resto de data/processed/ (fraud_labels.csv, fraud_features.csv,
+# xgboost_predictions.csv), no es un archivo de datos grande/regenerable que no deba
+# trackearse, es una dependencia de la app.
+!data/processed/dashboard_summary.json
 
 # Modelos entrenados
 models/*.pkl
