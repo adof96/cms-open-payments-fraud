@@ -18,6 +18,15 @@ no las vuelve a derivar:
   entre categorías que one-hot diluiría y frequency encoding ignoraría (EDA sección 9).
   Se ajusta ÚNICAMENTE sobre el fold de entrenamiento y se aplica al de test con esas
   estadísticas - nunca se ajusta sobre el dataset completo antes de separar train/test.
+  Además, dentro del propio fold de entrenamiento el valor codificado de cada fila se
+  calcula **out-of-fold** (`TARGET_ENCODING_N_FOLDS` folds de `StratifiedKFold`): el
+  mapping que codifica una fila se ajusta sobre los OTROS folds, así la etiqueta de una
+  fila nunca contribuye a su propio feature. Sin esto (versión anterior), una categoría
+  chica con 1 positivo recibía un encoding inflado por la etiqueta de esa misma fila, y
+  el modelo podía aprender ese atajo en train (fuga severa en `manufacturer_name`,
+  ver EDA sección 9). El mapping que se guarda y se aplica a test / inferencia sigue
+  ajustado sobre TODO el fold de entrenamiento - el out-of-fold solo cambia cómo se
+  generan los valores de las filas de entrenamiento.
 - **`manufacturer_name`**: el enunciado de esta tarea no especifica su tratamiento.
   Tiene la misma alta cardinalidad y el mismo problema que `recipient_specialty` (EDA
   sección 4 ya mostraba spread de tasa de exclusión entre fabricantes), así que por
@@ -58,8 +67,8 @@ submuestreo silencioso.
 ## Sin CV para hiperparámetros
 
 Se usa un único split estratificado train/test (no k-fold) y valores de
-hiperparámetros razonables sin grid search, para mantener el alcance manejable. Si en
-el futuro se agrega tuning o CV sobre el target encoding, debe usarse
+hiperparámetros razonables sin grid search, para mantener el alcance manejable. El único
+k-fold del módulo es el del target encoding out-of-fold (arriba), y usa
 `StratifiedKFold` (no `KFold`), dado el desbalance severo de `is_excluded`.
 """
 
@@ -76,7 +85,7 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from xgboost import XGBClassifier
 
 from src.config import MODELS_DIR, PROCESSED_DATA_DIR, RANDOM_STATE, TARGET_COLUMN
@@ -106,6 +115,14 @@ MIN_CATEGORY_COUNT = 1000
 # especialidades/fabricantes de cola larga tienen pocas decenas de filas) no obtengan
 # una tasa 0% o 100% extrema por puro ruido de muestra chica.
 TARGET_ENCODING_SMOOTHING = 50.0
+
+# Folds del target encoding out-of-fold. 5 es el default estándar: cada mapping se
+# ajusta sobre el 80% del fold de entrenamiento (casi tan estable como el mapping
+# completo), y con ~3,047 positivos de train quedan ~610 positivos por fold, suficiente
+# para que StratifiedKFold reparta positivos parejo. Más folds acercarían los mappings
+# out-of-fold al completo a cambio de más cómputo, sin cambiar el punto (evitar que la
+# etiqueta de una fila entre en su propio feature).
+TARGET_ENCODING_N_FOLDS = 5
 
 BUCKET_COLUMNS = ["payment_form", "payment_nature"]
 TARGET_ENCODED_COLUMNS = ["recipient_specialty", "manufacturer_name"]
@@ -186,6 +203,27 @@ def _apply_target_encoding(series: pd.Series, mapping: dict, global_mean: float)
     return series.map(mapping).fillna(global_mean).astype("float32")
 
 
+def _out_of_fold_target_encoding(
+    categories: pd.Series,
+    target: pd.Series,
+    smoothing: float = TARGET_ENCODING_SMOOTHING,
+    n_splits: int = TARGET_ENCODING_N_FOLDS,
+    random_state: int = RANDOM_STATE,
+) -> pd.Series:
+    """Codifica las filas de ENTRENAMIENTO sin que la etiqueta de una fila entre en su
+    propio valor: para cada fold de StratifiedKFold, ajusta el mapping sobre los otros
+    folds y lo aplica a las filas de este fold. Una categoría que solo aparece en el fold
+    propio cae a la media global de los otros folds.
+    """
+    encoded = np.empty(len(categories), dtype="float32")
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    for fit_idx, apply_idx in skf.split(categories, target):
+        fit_df = pd.DataFrame({"cat": categories.iloc[fit_idx].to_numpy(), "y": target.iloc[fit_idx].to_numpy()})
+        mapping, global_mean = _fit_target_encoding(fit_df, "cat", "y", smoothing)
+        encoded[apply_idx] = _apply_target_encoding(categories.iloc[apply_idx], mapping, global_mean).to_numpy()
+    return pd.Series(encoded, index=categories.index)
+
+
 def _one_hot_bucketed(train_series: pd.Series, test_series: pd.Series, prefix: str, min_count: int):
     keep = _fit_rare_category_bucket(train_series, min_count)
     train_bucketed = _apply_rare_category_bucket(train_series, keep)
@@ -243,13 +281,17 @@ def preprocess_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame):
     for col in TARGET_ENCODED_COLUMNS:
         train_filled = train_raw[col].fillna("Missing")
         test_filled = test_raw[col].fillna("Missing")
+        # Mapping sobre TODO el fold de entrenamiento: es el que se aplica a test y el que
+        # se guarda para inferencia (apply_preprocessing).
         mapping, global_mean = _fit_target_encoding(
             pd.DataFrame({col: train_filled, TARGET_COLUMN: train_raw[TARGET_COLUMN]}),
             col,
             TARGET_COLUMN,
             TARGET_ENCODING_SMOOTHING,
         )
-        train_out[f"{col}_te"] = _apply_target_encoding(train_filled, mapping, global_mean)
+        # Las filas de entrenamiento en sí se codifican out-of-fold (ver docstring del
+        # módulo) - aplicarles el mapping completo filtraría su propia etiqueta.
+        train_out[f"{col}_te"] = _out_of_fold_target_encoding(train_filled, train_raw[TARGET_COLUMN])
         test_out[f"{col}_te"] = _apply_target_encoding(test_filled, mapping, global_mean)
         artifacts["target_encoding"][col] = {"mapping": mapping, "global_mean": global_mean}
 
@@ -320,12 +362,35 @@ def _evaluate(model, X_test: pd.DataFrame, y_test: pd.Series, label: str) -> dic
     }
 
 
+def build_xgboost(neg_pos_ratio: float, random_state: int = RANDOM_STATE) -> XGBClassifier:
+    """XGBoost con los hiperparámetros de este módulo - compartido con
+    src/models/ablation_target_encoding.py para que las variantes del ablation difieran
+    solo en las features, no en el modelo."""
+    return XGBClassifier(
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.1,
+        scale_pos_weight=neg_pos_ratio,
+        eval_metric="aucpr",
+        random_state=random_state,
+        n_jobs=-1,
+    )
+
+
 def train_and_evaluate(
     features_path: Path | None = None,
     negative_sample_frac: float = NEGATIVE_SAMPLE_FRAC,
     test_size: float = TEST_SIZE,
     random_state: int = RANDOM_STATE,
+    artifact_suffix: str = "",
 ) -> dict:
+    """Entrena y evalúa RF + XGBoost y guarda los artefactos en models/.
+
+    `artifact_suffix` permite guardar un candidato sin pisar los artefactos en producción
+    (p.ej. "_oof" -> xgboost_is_excluded_oof.pkl): predictor.py, tune_threshold.py y la app
+    de Streamlit leen los nombres sin sufijo, así que un candidato no les cambia nada hasta
+    que se promueva explícitamente.
+    """
     features_path = features_path or (PROCESSED_DATA_DIR / FRAUD_FEATURES_FILENAME)
 
     sample = _load_stratified_sample(features_path, negative_sample_frac=negative_sample_frac)
@@ -353,15 +418,7 @@ def train_and_evaluate(
     )
     rf.fit(X_train, y_train)
 
-    xgb = XGBClassifier(
-        n_estimators=300,
-        max_depth=6,
-        learning_rate=0.1,
-        scale_pos_weight=neg_pos_ratio,
-        eval_metric="aucpr",
-        random_state=random_state,
-        n_jobs=-1,
-    )
+    xgb = build_xgboost(neg_pos_ratio, random_state=random_state)
     xgb.fit(X_train, y_train)
 
     results = {
@@ -380,9 +437,9 @@ def train_and_evaluate(
     }
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    save_model(rf, MODELS_DIR / "random_forest_is_excluded.pkl")
-    save_model(xgb, MODELS_DIR / "xgboost_is_excluded.pkl")
-    save_model(artifacts, MODELS_DIR / "supervised_preprocessing.pkl")
+    save_model(rf, MODELS_DIR / f"random_forest_is_excluded{artifact_suffix}.pkl")
+    save_model(xgb, MODELS_DIR / f"xgboost_is_excluded{artifact_suffix}.pkl")
+    save_model(artifacts, MODELS_DIR / f"supervised_preprocessing{artifact_suffix}.pkl")
 
     return {
         "sample_rows": int(len(sample)),
@@ -400,7 +457,9 @@ def train_and_evaluate(
 
 
 if __name__ == "__main__":
-    summary = train_and_evaluate()
+    import sys
+
+    summary = train_and_evaluate(artifact_suffix=sys.argv[1] if len(sys.argv) > 1 else "")
     print(f"sample_rows: {summary['sample_rows']:,}")
     print(f"sample_positives: {summary['sample_positives']:,}")
     print(f"sample_negatives: {summary['sample_negatives']:,}")
