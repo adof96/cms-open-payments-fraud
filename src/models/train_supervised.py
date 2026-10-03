@@ -64,6 +64,19 @@ tomada con una sola pasada en chunks sobre fraud_features.csv (mismo patrón que
 EDA). Esto se declara explícitamente aquí y se reporta en el resumen final - no es un
 submuestreo silencioso.
 
+## Split a nivel proveedor (NPI)
+
+`is_excluded` es un dato por PROVEEDOR (el cruce con la LEIE es por NPI en
+clean_data.py), pero los 3,809 pagos excluidos vienen de solo 381 proveedores. Con un
+split por fila, ~90% de los pagos excluidos del test pertenecían a un proveedor que
+también tenía pagos en train: el modelo se evaluaba en parte en reconocer proveedores ya
+vistos, no en generalizar a proveedores nuevos. Por eso `train_and_evaluate` separa
+PROVEEDORES (estratificando por si el proveedor tiene algún pago excluido) y manda cada
+fila al lado de su proveedor, y los folds del target encoding out-of-fold usan
+`StratifiedGroupKFold` por proveedor. El NPI no está en fraud_features.csv: se recupera
+por Record_ID desde fraud_labels.csv (`attach_provider_ids`), sin regenerar el archivo
+de 3.39GB.
+
 ## Sin CV para hiperparámetros
 
 Se usa un único split estratificado train/test (no k-fold) y valores de
@@ -85,10 +98,11 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, train_test_split
 from xgboost import XGBClassifier
 
 from src.config import MODELS_DIR, PROCESSED_DATA_DIR, RANDOM_STATE, TARGET_COLUMN
+from src.data.clean_data import DEFAULT_OUTPUT_FILENAME as FRAUD_LABELS_FILENAME
 from src.features.build_features import DEFAULT_OUTPUT_FILENAME as FRAUD_FEATURES_FILENAME
 from src.models.model_io import save_model
 
@@ -124,6 +138,8 @@ TARGET_ENCODING_SMOOTHING = 50.0
 # etiqueta de una fila entre en su propio feature).
 TARGET_ENCODING_N_FOLDS = 5
 
+PROVIDER_COLUMN = "Covered_Recipient_NPI"
+
 BUCKET_COLUMNS = ["payment_form", "payment_nature"]
 TARGET_ENCODED_COLUMNS = ["recipient_specialty", "manufacturer_name"]
 
@@ -149,12 +165,18 @@ def _load_stratified_sample(
     negative_sample_frac: float = NEGATIVE_SAMPLE_FRAC,
     chunksize: int = DEFAULT_CHUNKSIZE,
     random_state: int = RANDOM_STATE,
+    usecols: list[str] = USECOLS,
 ) -> pd.DataFrame:
     """Lee fraud_features.csv en chunks (una sola pasada) y arma una muestra
     estratificada: todas las filas is_excluded=1 + una fracción aleatoria fija de las
     is_excluded=0. No carga el dataset completo en memoria en ningún momento.
+
+    `usecols` permite sumar columnas (p.ej. Record_ID para recuperar el NPI) sin cambiar
+    QUÉ filas se muestrean: el muestreo depende solo del orden/largo de cada chunk, no de
+    sus columnas, así que la muestra es la misma fila por fila con o sin columnas extra.
     """
     dtype = {
+        "Record_ID": "int64",
         "payment_amount_log": "float32",
         "num_payments_included": "float32",
         "payment_month": "float32",
@@ -165,8 +187,9 @@ def _load_stratified_sample(
         TARGET_COLUMN: "int8",
         "is_excluded_name_match": "int8",
     }
+    dtype = {col: t for col, t in dtype.items() if col in usecols}
     reader = pd.read_csv(
-        features_path, usecols=USECOLS, dtype=dtype, chunksize=chunksize, low_memory=False
+        features_path, usecols=usecols, dtype=dtype, chunksize=chunksize, low_memory=False
     )
     parts = []
     for chunk in reader:
@@ -175,6 +198,89 @@ def _load_stratified_sample(
         parts.append(chunk[~excl].sample(frac=negative_sample_frac, random_state=random_state))
     sample = pd.concat(parts, ignore_index=True)
     return sample.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+
+
+def attach_provider_ids(
+    sample: pd.DataFrame, labels_path: Path | None = None, chunksize: int = DEFAULT_CHUNKSIZE
+) -> pd.Series:
+    """Devuelve el NPI (Covered_Recipient_NPI) de cada fila de `sample`, buscándolo por
+    Record_ID en fraud_labels.csv.
+
+    fraud_features.csv no trae el NPI, y regenerarlo (3.39GB) solo para sumar una columna
+    no vale la pena: fraud_labels.csv sí lo trae, así que se lee en chunks quedándose solo
+    con las filas cuyos Record_ID están en la muestra (~391k de 15.5M) - nunca se carga el
+    archivo completo. Falla si algún Record_ID de la muestra no aparece (NPI nulo sí es
+    válido: hospitales docentes, ver `provider_groups`).
+    """
+    labels_path = labels_path or (PROCESSED_DATA_DIR / FRAUD_LABELS_FILENAME)
+    wanted = pd.Index(sample["Record_ID"].unique())
+    parts = []
+    reader = pd.read_csv(
+        labels_path,
+        usecols=["Record_ID", PROVIDER_COLUMN],
+        dtype={"Record_ID": "int64", PROVIDER_COLUMN: "Int64"},
+        chunksize=chunksize,
+    )
+    for chunk in reader:
+        parts.append(chunk[chunk["Record_ID"].isin(wanted)])
+    lookup = pd.concat(parts).set_index("Record_ID")[PROVIDER_COLUMN]
+
+    if lookup.index.has_duplicates:
+        raise RuntimeError("fraud_labels.csv tiene Record_ID duplicados - el lookup de NPI sería ambiguo.")
+    missing = wanted.difference(lookup.index)
+    if len(missing):
+        raise RuntimeError(f"{len(missing):,} Record_ID de la muestra no están en {labels_path.name}.")
+    return sample["Record_ID"].map(lookup).astype("Int64").rename(PROVIDER_COLUMN)
+
+
+def provider_groups(npi: pd.Series) -> pd.Series:
+    """Id de grupo por proveedor para los splits. Las filas sin NPI (hospitales docentes,
+    ~0.3%) reciben cada una su propio grupo negativo: no son un proveedor individual, y
+    como su is_excluded es siempre 0 (el cruce estricto exige NPI válido) no pueden filtrar
+    una etiqueta positiva entre lados. Agruparlas todas en un único grupo, en cambio,
+    mandaría todos los hospitales docentes a un solo lado del split.
+    """
+    groups = npi.astype("float64")
+    missing = groups.isna().to_numpy()
+    groups[missing] = -1 - np.arange(missing.sum())
+    return groups.astype("int64").rename("provider_group")
+
+
+def provider_level_split(
+    sample: pd.DataFrame, groups: pd.Series, test_size: float = TEST_SIZE, random_state: int = RANDOM_STATE
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Separa PROVEEDORES (no filas) en train/test, estratificando por si el proveedor
+    tiene algún pago excluido, y manda cada fila al lado de su proveedor. Ningún
+    proveedor queda en ambos lados. `test_size` es la fracción de proveedores, no de filas.
+    """
+    provider_label = sample[TARGET_COLUMN].groupby(groups).max()
+    _, test_providers = train_test_split(
+        provider_label.index, test_size=test_size, stratify=provider_label, random_state=random_state
+    )
+    in_test = groups.isin(test_providers).to_numpy()
+    return sample[~in_test], sample[in_test]
+
+
+def load_provider_split(
+    features_path: Path | None = None,
+    labels_path: Path | None = None,
+    negative_sample_frac: float = NEGATIVE_SAMPLE_FRAC,
+    test_size: float = TEST_SIZE,
+    random_state: int = RANDOM_STATE,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """Misma muestra estratificada que siempre (mismas filas), con el NPI recuperado y
+    separada a nivel proveedor. Devuelve (train_raw, test_raw, train_groups, test_groups).
+    """
+    features_path = features_path or (PROCESSED_DATA_DIR / FRAUD_FEATURES_FILENAME)
+    sample = _load_stratified_sample(
+        features_path,
+        negative_sample_frac=negative_sample_frac,
+        random_state=random_state,
+        usecols=USECOLS + ["Record_ID"],
+    )
+    groups = provider_groups(attach_provider_ids(sample, labels_path))
+    train_raw, test_raw = provider_level_split(sample, groups, test_size=test_size, random_state=random_state)
+    return train_raw, test_raw, groups.loc[train_raw.index], groups.loc[test_raw.index]
 
 
 def _fit_rare_category_bucket(train_series: pd.Series, min_count: int) -> set:
@@ -209,15 +315,26 @@ def _out_of_fold_target_encoding(
     smoothing: float = TARGET_ENCODING_SMOOTHING,
     n_splits: int = TARGET_ENCODING_N_FOLDS,
     random_state: int = RANDOM_STATE,
+    groups: pd.Series | None = None,
 ) -> pd.Series:
     """Codifica las filas de ENTRENAMIENTO sin que la etiqueta de una fila entre en su
-    propio valor: para cada fold de StratifiedKFold, ajusta el mapping sobre los otros
-    folds y lo aplica a las filas de este fold. Una categoría que solo aparece en el fold
-    propio cae a la media global de los otros folds.
+    propio valor: para cada fold, ajusta el mapping sobre los otros folds y lo aplica a las
+    filas de este fold. Una categoría que solo aparece en el fold propio cae a la media
+    global de los otros folds.
+
+    Con `groups` (ids de proveedor) usa StratifiedGroupKFold: un proveedor nunca está a la
+    vez del lado que ajusta y del que se codifica, así que tampoco filtran las etiquetas de
+    OTRAS filas del mismo proveedor (is_excluded es un dato por proveedor). Sin `groups`
+    usa StratifiedKFold por fila, como el candidato `_oof` anterior.
     """
     encoded = np.empty(len(categories), dtype="float32")
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    for fit_idx, apply_idx in skf.split(categories, target):
+    if groups is None:
+        folds = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state).split(categories, target)
+    else:
+        folds = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state).split(
+            categories, target, groups
+        )
+    for fit_idx, apply_idx in folds:
         fit_df = pd.DataFrame({"cat": categories.iloc[fit_idx].to_numpy(), "y": target.iloc[fit_idx].to_numpy()})
         mapping, global_mean = _fit_target_encoding(fit_df, "cat", "y", smoothing)
         encoded[apply_idx] = _apply_target_encoding(categories.iloc[apply_idx], mapping, global_mean).to_numpy()
@@ -235,11 +352,16 @@ def _one_hot_bucketed(train_series: pd.Series, test_series: pd.Series, prefix: s
     return train_dummies, test_dummies, sorted(keep)
 
 
-def preprocess_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame):
+def preprocess_features(
+    train_raw: pd.DataFrame, test_raw: pd.DataFrame, train_groups: pd.Series | None = None
+):
     """Ajusta todo el preprocesamiento (bucketing, target encoding, imputación) SOLO
     sobre train_raw y lo aplica a ambos splits. Devuelve (X_train, X_test, artifacts)
     donde artifacts guarda todo lo necesario para reproducir la transformación sobre
     datos nuevos (p.ej. en un futuro src/inference/predictor.py).
+
+    `train_groups` (ids de proveedor de las filas de train) activa el target encoding
+    out-of-fold agrupado por proveedor; sin él, los folds son por fila.
     """
     train_out = pd.DataFrame(index=train_raw.index)
     test_out = pd.DataFrame(index=test_raw.index)
@@ -291,7 +413,9 @@ def preprocess_features(train_raw: pd.DataFrame, test_raw: pd.DataFrame):
         )
         # Las filas de entrenamiento en sí se codifican out-of-fold (ver docstring del
         # módulo) - aplicarles el mapping completo filtraría su propia etiqueta.
-        train_out[f"{col}_te"] = _out_of_fold_target_encoding(train_filled, train_raw[TARGET_COLUMN])
+        train_out[f"{col}_te"] = _out_of_fold_target_encoding(
+            train_filled, train_raw[TARGET_COLUMN], groups=train_groups
+        )
         test_out[f"{col}_te"] = _apply_target_encoding(test_filled, mapping, global_mean)
         artifacts["target_encoding"][col] = {"mapping": mapping, "global_mean": global_mean}
 
@@ -377,29 +501,91 @@ def build_xgboost(neg_pos_ratio: float, random_state: int = RANDOM_STATE) -> XGB
     )
 
 
+def feature_gain_shares(model: XGBClassifier) -> pd.Series:
+    """Participación de cada feature en el total_gain de un XGBoost, de mayor a menor."""
+    gains = pd.Series(model.get_booster().get_score(importance_type="total_gain"))
+    return (gains / gains.sum()).sort_values(ascending=False)
+
+
+def _split_stats(raw: pd.DataFrame, groups: pd.Series) -> dict:
+    positive_providers = raw[TARGET_COLUMN].groupby(groups).max()
+    return {
+        "rows": int(len(raw)),
+        "providers": int(groups[groups >= 0].nunique()),
+        "rows_without_npi": int((groups < 0).sum()),
+        "excluded_providers": int(positive_providers[positive_providers.index >= 0].sum()),
+        "excluded_rows": int(raw[TARGET_COLUMN].sum()),
+        "row_positive_rate": float(raw[TARGET_COLUMN].mean()),
+    }
+
+
+DEFAULT_CANDIDATE_SUFFIX = "_candidate"
+PRODUCTION_WARNING = (
+    "ATENCIÓN: --promote sobrescribe los artefactos de PRODUCCIÓN en models/ "
+    "(xgboost_is_excluded.pkl, random_forest_is_excluded.pkl, supervised_preprocessing.pkl), "
+    "que usan predictor.py, tune_threshold.py y la app de Streamlit. tune_threshold.py tiene "
+    "hardcodeadas las métricas del modelo actual y el umbral de predictor.py se ajustó para él: "
+    "ambos quedan desactualizados hasta regenerarlos."
+)
+
+
+def resolve_artifact_suffix(artifact_suffix: str, promote: bool) -> str:
+    """Decide el sufijo de los artefactos a escribir, con la regla de seguridad del CLI:
+    los nombres de producción (sufijo "") solo se escriben con un sufijo explícitamente
+    vacío Y `promote=True`. Sin promote, un sufijo vacío cae a DEFAULT_CANDIDATE_SUFFIX; un
+    sufijo con nombre (p.ej. "_provider_split") se respeta como candidato. Promote con un
+    sufijo no vacío es una contradicción y se rechaza.
+    """
+    if promote:
+        if artifact_suffix != "":
+            raise ValueError(
+                f"promote=True exige un sufijo vacío (nombres de producción), no {artifact_suffix!r}."
+            )
+        return ""
+    return artifact_suffix or DEFAULT_CANDIDATE_SUFFIX
+
+
 def train_and_evaluate(
     features_path: Path | None = None,
     negative_sample_frac: float = NEGATIVE_SAMPLE_FRAC,
     test_size: float = TEST_SIZE,
     random_state: int = RANDOM_STATE,
-    artifact_suffix: str = "",
+    artifact_suffix: str = DEFAULT_CANDIDATE_SUFFIX,
+    include_random_forest: bool = True,
+    promote: bool = False,
 ) -> dict:
-    """Entrena y evalúa RF + XGBoost y guarda los artefactos en models/.
+    """Entrena y evalúa XGBoost (y RF si `include_random_forest`) y guarda los artefactos
+    en models/.
 
-    `artifact_suffix` permite guardar un candidato sin pisar los artefactos en producción
-    (p.ej. "_oof" -> xgboost_is_excluded_oof.pkl): predictor.py, tune_threshold.py y la app
-    de Streamlit leen los nombres sin sufijo, así que un candidato no les cambia nada hasta
-    que se promueva explícitamente.
+    El split train/test y los folds del target encoding son a nivel PROVEEDOR (NPI), no
+    por fila: is_excluded es un dato por proveedor, y con un split por fila ~90% de los
+    pagos excluidos del test pertenecían a un proveedor que también estaba en train - el
+    modelo se evaluaba en parte en reconocer proveedores ya vistos. `test_size` es la
+    fracción de proveedores; las filas siguen a su proveedor.
+
+    `artifact_suffix` (por defecto "_candidate") guarda un candidato sin pisar los
+    artefactos en producción: predictor.py, tune_threshold.py y la app de Streamlit leen
+    los nombres sin sufijo, así que un candidato no les cambia nada. Escribir los nombres
+    de producción exige `artifact_suffix=""` Y `promote=True` (ver resolve_artifact_suffix);
+    `artifact_suffix=""` sin promote falla antes de cargar ningún dato.
     """
-    features_path = features_path or (PROCESSED_DATA_DIR / FRAUD_FEATURES_FILENAME)
+    if artifact_suffix == "" and not promote:
+        raise ValueError('artifact_suffix="" escribe los nombres de PRODUCCIÓN: requiere promote=True.')
+    artifact_suffix = resolve_artifact_suffix(artifact_suffix, promote)
+    if promote:
+        print(PRODUCTION_WARNING)
 
-    sample = _load_stratified_sample(features_path, negative_sample_frac=negative_sample_frac)
-
-    train_raw, test_raw = train_test_split(
-        sample, test_size=test_size, stratify=sample[TARGET_COLUMN], random_state=random_state
+    train_raw, test_raw, train_groups, test_groups = load_provider_split(
+        features_path,
+        negative_sample_frac=negative_sample_frac,
+        test_size=test_size,
+        random_state=random_state,
     )
+    shared_providers = set(train_groups[train_groups >= 0]) & set(test_groups[test_groups >= 0])
+    if shared_providers:
+        raise RuntimeError(f"{len(shared_providers)} proveedores quedaron en train y test a la vez.")
 
-    X_train, X_test, artifacts = preprocess_features(train_raw, test_raw)
+    X_train, X_test, artifacts = preprocess_features(train_raw, test_raw, train_groups=train_groups)
     y_train = train_raw[TARGET_COLUMN].reset_index(drop=True)
     y_test = test_raw[TARGET_COLUMN].reset_index(drop=True)
     y_test_name_match = test_raw["is_excluded_name_match"].reset_index(drop=True)
@@ -408,26 +594,9 @@ def train_and_evaluate(
     n_neg = int(len(y_train) - n_pos)
     neg_pos_ratio = n_neg / n_pos  # calculado del set de entrenamiento real, no hardcodeado
 
-    rf = RandomForestClassifier(
-        n_estimators=300,
-        max_depth=20,
-        min_samples_leaf=5,
-        class_weight="balanced",
-        random_state=random_state,
-        n_jobs=-1,
-    )
-    rf.fit(X_train, y_train)
-
     xgb = build_xgboost(neg_pos_ratio, random_state=random_state)
     xgb.fit(X_train, y_train)
-
     results = {
-        "random_forest": {
-            "primary_is_excluded": _evaluate(rf, X_test, y_test, "is_excluded"),
-            "secondary_is_excluded_name_match": _evaluate(
-                rf, X_test, y_test_name_match, "is_excluded_name_match"
-            ),
-        },
         "xgboost": {
             "primary_is_excluded": _evaluate(xgb, X_test, y_test, "is_excluded"),
             "secondary_is_excluded_name_match": _evaluate(
@@ -437,18 +606,31 @@ def train_and_evaluate(
     }
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    save_model(rf, MODELS_DIR / f"random_forest_is_excluded{artifact_suffix}.pkl")
+    if include_random_forest:
+        rf = RandomForestClassifier(
+            n_estimators=300,
+            max_depth=20,
+            min_samples_leaf=5,
+            class_weight="balanced",
+            random_state=random_state,
+            n_jobs=-1,
+        )
+        rf.fit(X_train, y_train)
+        results["random_forest"] = {
+            "primary_is_excluded": _evaluate(rf, X_test, y_test, "is_excluded"),
+            "secondary_is_excluded_name_match": _evaluate(
+                rf, X_test, y_test_name_match, "is_excluded_name_match"
+            ),
+        }
+        save_model(rf, MODELS_DIR / f"random_forest_is_excluded{artifact_suffix}.pkl")
     save_model(xgb, MODELS_DIR / f"xgboost_is_excluded{artifact_suffix}.pkl")
     save_model(artifacts, MODELS_DIR / f"supervised_preprocessing{artifact_suffix}.pkl")
 
     return {
-        "sample_rows": int(len(sample)),
-        "sample_positives": int(sample[TARGET_COLUMN].sum()),
-        "sample_negatives": int(len(sample) - sample[TARGET_COLUMN].sum()),
-        "train_rows": int(len(train_raw)),
-        "test_rows": int(len(test_raw)),
+        "split": {"train": _split_stats(train_raw, train_groups), "test": _split_stats(test_raw, test_groups)},
         "train_neg_pos_ratio": neg_pos_ratio,
         "feature_columns": artifacts["feature_columns"],
+        "xgboost_gain_shares": feature_gain_shares(xgb),
         "min_category_count": MIN_CATEGORY_COUNT,
         "target_encoding_smoothing": TARGET_ENCODING_SMOOTHING,
         "negative_sample_frac": negative_sample_frac,
@@ -457,14 +639,39 @@ def train_and_evaluate(
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    summary = train_and_evaluate(artifact_suffix=sys.argv[1] if len(sys.argv) > 1 else "")
-    print(f"sample_rows: {summary['sample_rows']:,}")
-    print(f"sample_positives: {summary['sample_positives']:,}")
-    print(f"sample_negatives: {summary['sample_negatives']:,}")
-    print(f"train_rows: {summary['train_rows']:,}  test_rows: {summary['test_rows']:,}")
+    parser = argparse.ArgumentParser(
+        description='Sin --promote, nunca escribe los nombres de producción. Para promover: "" --promote'
+    )
+    parser.add_argument(
+        "artifact_suffix", nargs="?", default=None,
+        help=f'sufijo del candidato, p.ej. "_provider_split" (default: {DEFAULT_CANDIDATE_SUFFIX})',
+    )
+    parser.add_argument("--xgboost-only", action="store_true", help="no entrenar Random Forest")
+    parser.add_argument(
+        "--promote", action="store_true",
+        help='escribe los nombres de PRODUCCIÓN; exige además pasar el sufijo vacío explícito ""',
+    )
+    args = parser.parse_args()
+
+    if args.promote and args.artifact_suffix is None:
+        parser.error('--promote exige pasar explícitamente el sufijo vacío: python -m src.models.train_supervised "" --promote')
+    try:
+        suffix = resolve_artifact_suffix(args.artifact_suffix or "", args.promote)
+    except ValueError as e:
+        parser.error(str(e))
+    if args.artifact_suffix == "" and not args.promote:
+        print(f'Sufijo vacío sin --promote: se guarda como candidato "{DEFAULT_CANDIDATE_SUFFIX}", no en producción.')
+    print(f"Escribiendo artefactos con sufijo {suffix!r}" + (" (PRODUCCIÓN)" if suffix == "" else " (candidato)"))
+
+    summary = train_and_evaluate(
+        artifact_suffix=suffix, include_random_forest=not args.xgboost_only, promote=args.promote
+    )
+    for side, stats in summary["split"].items():
+        print(f"{side}: {stats}")
     print(f"train_neg_pos_ratio: {summary['train_neg_pos_ratio']:.2f}")
+    print(f"xgboost gain shares:\n{summary['xgboost_gain_shares'].round(4).to_string()}")
     print(f"min_category_count: {summary['min_category_count']}")
     print(f"target_encoding_smoothing: {summary['target_encoding_smoothing']}")
     print(f"feature_columns ({len(summary['feature_columns'])}): {summary['feature_columns']}")

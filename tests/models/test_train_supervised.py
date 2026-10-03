@@ -5,11 +5,17 @@ from sklearn.model_selection import StratifiedKFold
 
 from src.config import TARGET_COLUMN
 from src.models.train_supervised import (
+    DEFAULT_CANDIDATE_SUFFIX,
+    PROVIDER_COLUMN,
+    resolve_artifact_suffix,
+    train_and_evaluate,
     TARGET_ENCODING_SMOOTHING,
-    _fit_target_encoding,
     _out_of_fold_target_encoding,
     apply_preprocessing,
+    attach_provider_ids,
     preprocess_features,
+    provider_groups,
+    provider_level_split,
 )
 
 
@@ -84,3 +90,107 @@ def test_train_rows_are_encoded_out_of_fold_not_with_full_mapping():
     full = artifacts["target_encoding"]["manufacturer_name"]
     full_mapping_values = filled.map(full["mapping"]).astype("float32")
     assert not np.allclose(X_train["manufacturer_name_te"], full_mapping_values)
+
+
+# --- Split y folds a nivel proveedor ---------------------------------------------------
+
+def _provider_sample(seed: int = 0) -> tuple[pd.DataFrame, pd.Series]:
+    # 200 proveedores con 1-8 pagos cada uno; 30 de ellos excluidos (todas sus filas = 1,
+    # porque is_excluded es un dato por proveedor). Más 10 filas sin NPI (hospitales).
+    rng = np.random.default_rng(seed)
+    npis, labels = [], []
+    for provider in range(200):
+        k = int(rng.integers(1, 9))
+        npis += [1_000_000_000 + provider] * k
+        labels += [int(provider < 30)] * k
+    npis += [None] * 10
+    labels += [0] * 10
+    sample = pd.DataFrame({TARGET_COLUMN: labels}, index=pd.RangeIndex(len(labels)))
+    npi = pd.Series(npis, index=sample.index, dtype="Int64")
+    return sample, provider_groups(npi)
+
+
+def test_provider_level_split_never_puts_a_provider_on_both_sides():
+    sample, groups = _provider_sample()
+
+    train_raw, test_raw = provider_level_split(sample, groups, test_size=0.2, random_state=42)
+
+    train_providers, test_providers = set(groups[train_raw.index]), set(groups[test_raw.index])
+    assert train_providers.isdisjoint(test_providers)
+    assert len(train_raw) + len(test_raw) == len(sample)
+    # Estratificado por proveedor: hay proveedores excluidos en ambos lados.
+    assert train_raw[TARGET_COLUMN].sum() > 0 and test_raw[TARGET_COLUMN].sum() > 0
+
+
+def test_provider_groups_gives_each_missing_npi_its_own_group():
+    npi = pd.Series([111, None, 111, None, 222], dtype="Int64")
+
+    groups = provider_groups(npi)
+
+    assert groups[0] == groups[2] == 111 and groups[4] == 222
+    assert groups[1] < 0 and groups[3] < 0 and groups[1] != groups[3]
+
+
+def test_attach_provider_ids_looks_up_npi_by_record_id(tmp_path):
+    labels = tmp_path / "labels.csv"
+    pd.DataFrame({
+        "Record_ID": [10, 11, 12, 13],
+        PROVIDER_COLUMN: [555, None, 777, 999],
+        TARGET_COLUMN: [0, 0, 1, 0],
+    }).to_csv(labels, index=False)
+
+    npi = attach_provider_ids(pd.DataFrame({"Record_ID": [12, 10, 11]}), labels_path=labels)
+
+    assert npi.tolist()[:2] == [777, 555] and pd.isna(npi.iloc[2])
+
+    with pytest.raises(RuntimeError):
+        attach_provider_ids(pd.DataFrame({"Record_ID": [10, 404]}), labels_path=labels)
+
+
+def test_group_folds_hide_other_rows_of_the_same_provider():
+    # El proveedor P (excluido, 6 pagos) es el único al que le paga 'RareCo'. Con folds
+    # agrupados, cuando se codifica una fila de P ninguna otra fila de P está del lado que
+    # ajusta, así que 'RareCo' no existe ahí y cae a la media global. Con folds por fila,
+    # las otras filas de P sí filtran su etiqueta y el encoding sube por encima de la media.
+    n_other = 300
+    cats = pd.Series(["RareCo"] * 6 + ["BigCo"] * n_other)
+    y = pd.Series([1] * 6 + [1] * 15 + [0] * (n_other - 15))
+    groups = pd.Series([-999] * 6 + list(range(n_other)))
+
+    grouped = _out_of_fold_target_encoding(cats, y, n_splits=5, random_state=0, groups=groups)
+    row_level = _out_of_fold_target_encoding(cats, y, n_splits=5, random_state=0)
+
+    global_mean = y.mean()
+    assert (grouped.iloc[:6] < global_mean * 1.5).all()
+    assert (row_level.iloc[:6] > grouped.iloc[:6]).all()
+
+
+# --- Compuerta de seguridad: nombres de producción solo con promote explícito ----------
+
+def test_suffix_resolution_never_yields_production_names_without_promote():
+    assert resolve_artifact_suffix("", promote=False) == DEFAULT_CANDIDATE_SUFFIX
+    assert resolve_artifact_suffix("_provider_split", promote=False) == "_provider_split"
+    assert resolve_artifact_suffix("", promote=True) == ""
+
+
+def test_promote_with_a_named_suffix_is_rejected():
+    with pytest.raises(ValueError):
+        resolve_artifact_suffix("_provider_split", promote=True)
+
+
+def test_train_and_evaluate_refuses_production_names_without_promote(monkeypatch):
+    # El chequeo corre antes de cargar datos: si no frenara, load_provider_split fallaría acá.
+    def _must_not_load(*args, **kwargs):
+        raise AssertionError("cargó datos antes de validar el sufijo")
+
+    monkeypatch.setattr("src.models.train_supervised.load_provider_split", _must_not_load)
+
+    with pytest.raises(ValueError, match="promote"):
+        train_and_evaluate(artifact_suffix="")
+
+
+def test_train_and_evaluate_defaults_to_the_candidate_suffix():
+    import inspect
+
+    default = inspect.signature(train_and_evaluate).parameters["artifact_suffix"].default
+    assert default == DEFAULT_CANDIDATE_SUFFIX != ""
