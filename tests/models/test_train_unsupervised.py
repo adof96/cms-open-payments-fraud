@@ -2,8 +2,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.config import TARGET_COLUMN
-from src.models.train_unsupervised import _evaluate_anomaly_ranking, preprocess_features
+from src.config import MODELS_DIR, TARGET_COLUMN
+from src.models.train_unsupervised import (
+    _evaluate_anomaly_ranking,
+    parse_cli_args,
+    preprocess_features,
+    train_and_evaluate,
+)
 
 
 def _raw_frame(n: int = 300, seed: int = 0) -> pd.DataFrame:
@@ -70,3 +75,89 @@ def test_anomaly_ranking_with_no_positives_returns_nan_rates():
 
     assert result["n_positive"] == 0
     assert np.isnan(result["top_5pct_capture_rate"])
+
+
+# --- Compuerta de seguridad: nombres de producción solo con promote explícito ----------
+# Datos y guardado mockeados: no se lee fraud_features.csv ni se escribe nada en models/.
+
+PRODUCTION_NAMES = {MODELS_DIR / "isolation_forest.pkl", MODELS_DIR / "unsupervised_preprocessing.pkl"}
+
+
+def _forbid_data_loading(monkeypatch):
+    def _must_not_load(*args, **kwargs):
+        raise AssertionError("cargó datos antes de validar el sufijo")
+
+    monkeypatch.setattr("src.models.train_unsupervised._load_random_sample", _must_not_load)
+
+
+def _mock_io(monkeypatch) -> list:
+    saved = []
+    monkeypatch.setattr("src.models.train_unsupervised._load_random_sample", lambda *a, **k: _raw_frame())
+    monkeypatch.setattr("src.models.train_unsupervised.save_model", lambda obj, path: saved.append(path))
+    return saved
+
+
+def test_empty_suffix_without_promote_raises_before_loading_data(monkeypatch):
+    _forbid_data_loading(monkeypatch)
+
+    with pytest.raises(ValueError, match="promote"):
+        train_and_evaluate(artifact_suffix="")
+
+
+def test_promote_with_a_named_suffix_raises_before_loading_data(monkeypatch):
+    _forbid_data_loading(monkeypatch)
+
+    with pytest.raises(ValueError, match="sufijo vacío"):
+        train_and_evaluate(artifact_suffix="_v2", promote=True)
+
+
+def test_default_call_writes_only_candidate_names(monkeypatch):
+    saved = _mock_io(monkeypatch)
+
+    summary = train_and_evaluate()
+
+    assert saved == [MODELS_DIR / "isolation_forest_candidate.pkl", MODELS_DIR / "unsupervised_preprocessing_candidate.pkl"]
+    assert PRODUCTION_NAMES.isdisjoint(saved)
+    assert set(summary) == {
+        "sample_rows", "sample_positives_is_excluded", "sample_positives_name_match", "feature_columns",
+        "min_category_count", "n_estimators", "n_jobs", "runtime_seconds", "results",
+    }
+
+
+def test_named_suffix_writes_that_candidate(monkeypatch):
+    saved = _mock_io(monkeypatch)
+
+    train_and_evaluate(artifact_suffix="_v2")
+
+    assert saved == [MODELS_DIR / "isolation_forest_v2.pkl", MODELS_DIR / "unsupervised_preprocessing_v2.pkl"]
+
+
+def test_empty_suffix_with_promote_writes_production_names_and_warns(monkeypatch, capsys):
+    saved = _mock_io(monkeypatch)
+
+    train_and_evaluate(artifact_suffix="", promote=True)
+
+    assert set(saved) == PRODUCTION_NAMES
+    assert "PRODUCCIÓN" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv, expected", [
+    ([], ("_candidate", False)),
+    (["_v2"], ("_v2", False)),
+    ([""], ("_candidate", False)),
+    (["", "--promote"], ("", True)),
+])
+def test_cli_suffix_rules(argv, expected, capsys):
+    assert parse_cli_args(argv) == expected
+    out = capsys.readouterr().out
+    if argv == [""]:
+        assert "sin --promote" in out
+    if expected[0] == "":
+        assert "(PRODUCCIÓN)" in out
+
+
+@pytest.mark.parametrize("argv", [["--promote"], ["_v2", "--promote"]])
+def test_cli_promote_without_explicit_empty_suffix_exits_with_error(argv):
+    with pytest.raises(SystemExit) as exc:
+        parse_cli_args(argv)
+    assert exc.value.code == 2

@@ -63,9 +63,22 @@ from src.config import MODELS_DIR, PROCESSED_DATA_DIR, RANDOM_STATE, TARGET_COLU
 from src.features.build_features import DEFAULT_OUTPUT_FILENAME as FRAUD_FEATURES_FILENAME
 from src.models.model_io import save_model
 from src.models.train_supervised import (
+    DEFAULT_CANDIDATE_SUFFIX,
     MIN_CATEGORY_COUNT,
     _apply_rare_category_bucket,
     _fit_rare_category_bucket,
+    resolve_artifact_suffix,
+)
+
+# Misma compuerta de seguridad que train_supervised.py (DEFAULT_CANDIDATE_SUFFIX y
+# resolve_artifact_suffix se importan de ahí, no se duplican): sin --promote nunca se
+# escriben los nombres de producción. Hoy ningún otro script ni la app lee estos dos
+# archivos, pero son el resultado reportado del enfoque no supervisado.
+PRODUCTION_WARNING = (
+    "ATENCIÓN: --promote sobrescribe los artefactos de PRODUCCIÓN en models/ "
+    "(isolation_forest.pkl, unsupervised_preprocessing.pkl): el Isolation Forest y el "
+    "preprocesamiento reportados como resultado del enfoque no supervisado. Ningún otro "
+    "script ni la app de Streamlit los lee hoy, pero el modelo anterior se pierde."
 )
 
 DEFAULT_CHUNKSIZE = 300_000
@@ -241,7 +254,24 @@ def train_and_evaluate(
     features_path: Path | None = None,
     sample_frac: float = SAMPLE_FRAC,
     random_state: int = RANDOM_STATE,
+    artifact_suffix: str = DEFAULT_CANDIDATE_SUFFIX,
+    promote: bool = False,
 ) -> dict:
+    """Entrena el Isolation Forest, lo evalúa contra is_excluded / is_excluded_name_match y
+    guarda los artefactos en models/.
+
+    `artifact_suffix` (por defecto "_candidate") guarda un candidato sin pisar los artefactos
+    en producción (isolation_forest.pkl, unsupervised_preprocessing.pkl). Escribir los nombres
+    de producción exige `artifact_suffix=""` Y `promote=True` (ver
+    train_supervised.resolve_artifact_suffix); `artifact_suffix=""` sin promote falla antes de
+    cargar ningún dato.
+    """
+    if artifact_suffix == "" and not promote:
+        raise ValueError('artifact_suffix="" escribe los nombres de PRODUCCIÓN: requiere promote=True.')
+    artifact_suffix = resolve_artifact_suffix(artifact_suffix, promote)
+    if promote:
+        print(PRODUCTION_WARNING)
+
     start = time.time()
     features_path = features_path or (PROCESSED_DATA_DIR / FRAUD_FEATURES_FILENAME)
 
@@ -271,8 +301,8 @@ def train_and_evaluate(
     }
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    save_model(model, MODELS_DIR / "isolation_forest.pkl")
-    save_model(artifacts, MODELS_DIR / "unsupervised_preprocessing.pkl")
+    save_model(model, MODELS_DIR / f"isolation_forest{artifact_suffix}.pkl")
+    save_model(artifacts, MODELS_DIR / f"unsupervised_preprocessing{artifact_suffix}.pkl")
     _log("models saved", start)
 
     return {
@@ -288,8 +318,41 @@ def train_and_evaluate(
     }
 
 
+def parse_cli_args(argv=None) -> tuple[str, bool]:
+    """Mismas reglas de CLI que train_supervised.py: sin argumentos -> "_candidate"; sufijo
+    con nombre -> ese candidato; sufijo vacío sin --promote -> "_candidate" con aviso; sufijo
+    vacío + --promote -> nombres de producción; --promote sin sufijo explícito o con un sufijo
+    con nombre -> error (sale antes de entrenar). Devuelve (sufijo, promote)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='Sin --promote, nunca escribe los nombres de producción. Para promover: "" --promote'
+    )
+    parser.add_argument(
+        "artifact_suffix", nargs="?", default=None,
+        help=f'sufijo del candidato, p.ej. "_v2" (default: {DEFAULT_CANDIDATE_SUFFIX})',
+    )
+    parser.add_argument(
+        "--promote", action="store_true",
+        help='escribe los nombres de PRODUCCIÓN; exige además pasar el sufijo vacío explícito ""',
+    )
+    args = parser.parse_args(argv)
+
+    if args.promote and args.artifact_suffix is None:
+        parser.error('--promote exige pasar explícitamente el sufijo vacío: python -m src.models.train_unsupervised "" --promote')
+    try:
+        suffix = resolve_artifact_suffix(args.artifact_suffix or "", args.promote)
+    except ValueError as e:
+        parser.error(str(e))
+    if args.artifact_suffix == "" and not args.promote:
+        print(f'Sufijo vacío sin --promote: se guarda como candidato "{DEFAULT_CANDIDATE_SUFFIX}", no en producción.')
+    print(f"Escribiendo artefactos con sufijo {suffix!r}" + (" (PRODUCCIÓN)" if suffix == "" else " (candidato)"))
+    return suffix, args.promote
+
+
 if __name__ == "__main__":
-    summary = train_and_evaluate()
+    suffix, promote = parse_cli_args()
+    summary = train_and_evaluate(artifact_suffix=suffix, promote=promote)
     print(f"\nsample_rows: {summary['sample_rows']:,}")
     print(f"sample_positives_is_excluded: {summary['sample_positives_is_excluded']:,}")
     print(f"sample_positives_name_match: {summary['sample_positives_name_match']:,}")
