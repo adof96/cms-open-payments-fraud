@@ -67,9 +67,10 @@ VALIDATION_WARNING = (
     "**This app demonstrates the pipeline. It is not a validated fraud detector.** "
     "Its payment-level model was validated with a row-level split, so the same excluded "
     "providers appeared in both training and test data. That overstates performance on new "
-    "providers: on a provider-level split (new providers only) the same model scores "
-    "PR-AUC 0.0165, which is nearly random. See the **Results** and **Limitations** "
-    "sections of README.md."
+    "providers: the same payment-level approach, retrained with a provider-level split (new "
+    "providers only), scores close to random (PR-AUC 0.0165, ROC-AUC 0.529). This app's model "
+    "itself was not re-evaluated that way. See the **Results** and **Limitations** sections "
+    "of README.md."
 )
 
 
@@ -190,7 +191,8 @@ def render_explore_tab(summary: dict) -> None:
     st.caption(
         "These precision, recall and F1 values come from the row-level test set, where about 90% "
         "of the excluded test payments belonged to providers also seen in training. They overstate "
-        "performance on new providers (provider-level split: PR-AUC 0.0165)."
+        "performance on new providers: the same approach, retrained with a provider-level split, "
+        "scores PR-AUC 0.0165."
     )
 
     fig, ax = plt.subplots(figsize=(6, 5))

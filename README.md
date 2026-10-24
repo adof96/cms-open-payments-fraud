@@ -5,11 +5,12 @@ receive from drug and medical-device manufacturers, by cross-referencing those p
 with the federal list of providers excluded for fraud.
 
 **Status:** this is a learning project, not a validated fraud detector. The first
-supervised results were inflated by two forms of leakage. Once those were removed, the
-payment-level model the Streamlit app uses scored close to random on new providers. A
-reframed provider-level model does better than a specialty-only baseline, but it has not
-been promoted and the app does not use it. See [Results](#results) and
-[Limitations](#limitations).
+supervised results were inflated by two forms of leakage. Once those were removed, the same
+payment-level approach the Streamlit app uses, retrained with a provider-level split, scored
+close to random on new providers (PR-AUC 0.0165, ROC-AUC 0.529). The app's production model
+itself was not re-evaluated that way. A reframed provider-level model does better than a
+specialty-only baseline, but it has not been promoted and the app does not use it. See
+[Results](#results) and [Limitations](#limitations).
 
 ## Overview and goal
 
@@ -98,12 +99,14 @@ XGBoost trained and tested with a **row-level** split, where each row is one pay
   model could score well by recognizing providers it had already seen. `payment_frequency`
   (a per-provider payment count) worked as a provider fingerprint.
 
-### 3. Provider-level split: the payment-level model collapses
+### 3. Provider-level split: the retrained payment-level approach collapses
 
-When the split is made by provider, so test providers are never seen in training:
+The same payment-level approach and features were retrained with a provider-level split, so
+test providers are never seen in training, and with out-of-fold encoding. These numbers
+belong to that retrained candidate, not to the production model file the app uses:
 
-- PR-AUC **0.0165**, ROC-AUC **0.529**: nearly random.
-- The same model scores PR-AUC **0.904** on its own training data, so it was memorizing
+- PR-AUC **0.0165**, ROC-AUC **0.529**: close to random.
+- The retrained model scores PR-AUC **0.904** on its own training data, so it was memorizing
   providers rather than learning patterns that carry over to new ones.
 
 ### 4. Reframing at the provider level
@@ -124,6 +127,10 @@ The default XGBoost still memorized at the provider level. A heavily constrained
 | Specialty alone | 0.686 | 0.034 |
 
 It beat specialty alone on all 5 splits, with no memorization gap between training and test.
+
+The depth-2 variant was chosen using the main split's test set, which biases its main-split
+number upward. It still beat specialty alone on the other four splits, so the result does
+not depend on that choice.
 
 ### 6. Cross-validated model selection
 
@@ -152,8 +159,11 @@ step 1.
   one.
 - **Few positives.** Only 381 excluded providers exist, and each test set has 76, so
   results vary noticeably from one split to another.
-- **The app uses the payment-level model,** the one that scores near random on new
-  providers.
+- **Even the best provider-level models are weak in absolute terms.** A PR-AUC of about
+  0.06 means most flagged providers would not be excluded.
+- **The app uses the payment-level model.** The same approach, retrained with a
+  provider-level split, scores close to random on new providers; the production model
+  itself was not re-evaluated that way.
 - **The row-level numbers overstate performance.** Every payment-level figure in the app
   (precision, recall, PR-AUC, flagged counts) comes from row-level evaluation or from
   scoring data the model was trained on.
@@ -240,7 +250,7 @@ them.
 pytest tests/models tests/features/test_build_provider_features.py
 ```
 
-These pass. The other test files (under `tests/data/`, `tests/inference/`,
+These pass (4 tests are skipped placeholders). The other test files (under `tests/data/`, `tests/inference/`,
 `tests/streamlit_app/`, `tests/visualization/`, and `tests/features/test_build_features.py`)
 are unimplemented placeholders from the original scaffold and currently fail.
 
