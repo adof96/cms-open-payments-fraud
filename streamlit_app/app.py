@@ -63,6 +63,15 @@ DEFAULT_NUM_PAYMENTS_INCLUDED = 1  # la inmensa mayoría de las filas trae exact
 DEFAULT_PAYMENT_MONTH = 6  # mitad de año, sin estacionalidad fuerte conocida
 DEFAULT_PAYMENT_DAY_OF_WEEK = 2  # miércoles, día "neutro" entre semana
 
+VALIDATION_WARNING = (
+    "**This app demonstrates the pipeline. It is not a validated fraud detector.** "
+    "Its payment-level model was validated with a row-level split, so the same excluded "
+    "providers appeared in both training and test data. That overstates performance on new "
+    "providers: on a provider-level split (new providers only) the same model scores "
+    "PR-AUC 0.0165, which is nearly random. See the **Results** and **Limitations** "
+    "sections of README.md."
+)
+
 
 @st.cache_data
 def load_summary() -> dict:
@@ -108,10 +117,15 @@ def render_explore_tab(summary: dict) -> None:
         f"{overall['total_excluded']:,}",
         f"{overall['excluded_rate'] * 100:.3f}% of all payments",
     )
+    st.caption(
+        "Flagged counts come from scoring the full dataset with the payment-level model, "
+        "including the rows it was trained on, so they are not an estimate of performance on "
+        "unseen data."
+    )
 
     st.caption(
         "Threshold used for `flagged_for_review`: "
-        f"**{THRESHOLD}** (chosen in tune_threshold.py for recall≈0.80 on the held-out test set)."
+        f"**{THRESHOLD}** (chosen in tune_threshold.py for recall 0.803 on the row-level test set)."
     )
 
     st.subheader("Flagged rate by category")
@@ -173,6 +187,11 @@ def render_explore_tab(summary: dict) -> None:
     m1.metric("Precision", f"{row['precision']:.3f}")
     m2.metric("Recall", f"{row['recall']:.3f}")
     m3.metric("F1", f"{row['f1']:.3f}")
+    st.caption(
+        "These precision, recall and F1 values come from the row-level test set, where about 90% "
+        "of the excluded test payments belonged to providers also seen in training. They overstate "
+        "performance on new providers (provider-level split: PR-AUC 0.0165)."
+    )
 
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.plot(sweep["recall"], sweep["precision"], color="#4c72b0")
@@ -225,7 +244,7 @@ def render_try_it_tab() -> None:
     manufacturer_options = sorted(artifacts["target_encoding"]["manufacturer_name"]["mapping"].keys())
 
     st.write(
-        "Fill in a hypothetical payment below. Fields not shown here use typical defaults: "
+        "Fill in a hypothetical payment below. Fields not shown here use fixed placeholder defaults: "
         f"{DEFAULT_NUM_PAYMENTS_INCLUDED} payment per record, month {DEFAULT_PAYMENT_MONTH} (June), "
         f"day of week {DEFAULT_PAYMENT_DAY_OF_WEEK} (Wednesday), and the recipient's historical "
         f"payment frequency set to the training median ({artifacts['payment_frequency_median']:.0f})."
@@ -269,7 +288,13 @@ def render_try_it_tab() -> None:
     else:
         st.success(f"**Not flagged** — risk score {probability:.4f} ({probability:.2%}), threshold {THRESHOLD}")
     st.caption(
-        "This is a **relative risk score**, not a calibrated real-world probability of fraud. "
+        "Three inputs are fixed placeholder defaults, not values you entered or values learned "
+        f"from data: payment month {DEFAULT_PAYMENT_MONTH}, day of week {DEFAULT_PAYMENT_DAY_OF_WEEK}, "
+        f"and payments included per record {DEFAULT_NUM_PAYMENTS_INCLUDED}."
+    )
+    st.caption(
+        "This is a **relative risk score from the payment-level model**, not a probability, and not "
+        "a calibrated real-world probability of fraud. "
         "The model was trained on a sample with roughly 1 exclusion per 100 payments (with class "
         "weighting), far richer in exclusions than the real population (~1 in 4,070). That helps it "
         "rank payments by risk, but its scores are systematically inflated relative to the true "
@@ -283,6 +308,7 @@ def main() -> None:
 
     tab_explore, tab_try_it = st.tabs(["Explore Results", "Try It Yourself"])
     with tab_explore:
+        st.warning(VALIDATION_WARNING)
         if not SUMMARY_PATH.exists():
             st.error(
                 f"{SUMMARY_PATH} not found — run "
@@ -291,6 +317,7 @@ def main() -> None:
         else:
             render_explore_tab(load_summary())
     with tab_try_it:
+        st.warning(VALIDATION_WARNING)
         render_try_it_tab()
 
 
