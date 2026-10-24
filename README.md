@@ -160,14 +160,33 @@ step 1.
 - **Placeholder defaults in the app.** Tab 2 ("Try It Yourself") fixes `payment_month` to
   6, `payment_day_of_week` to 2 and `num_payments_included` to 1. Only the
   `payment_frequency` median is learned from data.
-- **The app's model cannot be retrained exactly from the current code.**
-  `train_supervised.py` now uses the provider-level split by default, so it no longer
-  reproduces the row-level model behind the app. TODO: record which commit produced the
-  current production payment-level model.
+- **The app's model comes from an older version of the training code.** Commit
+  `061f4258aa63e598e8cac196be4d410afe84023a` contains the row-level-split, leaky-encoding
+  training code that produced the production models (`models/xgboost_is_excluded.pkl`,
+  `models/random_forest_is_excluded.pkl`, `models/supervised_preprocessing.pkl`); they were
+  trained from that code shortly before it was committed. `tune_threshold.py` rebuilds the
+  same row-level test set and checks that the production models still match the metrics
+  recorded from that run. To inspect or recreate that version without touching your
+  working tree, use a separate worktree:
+
+  ```bash
+  git worktree add ../op-fraud-v1 061f4258aa63e598e8cac196be4d410afe84023a
+  cd ../op-fraud-v1
+  git show HEAD:src/models/train_supervised.py     # inspect
+  python -m src.models.train_supervised            # recreate (see notes below)
+  ```
+
+  The worktree has no data, so `data/processed/fraud_features.csv` must be copied or linked
+  into it first. At that commit the script writes the production file names into the
+  worktree's own `models/`, not this checkout's. Whether a rerun reproduces the saved files
+  byte for byte has not been verified. Retraining from the current `main` gives a different
+  model than the one the app uses, because `train_supervised.py` now splits by provider and
+  encodes out-of-fold.
 - **Model files are not committed** (`models/*.pkl` is gitignored). On a fresh clone, Tab 1
   of the app works from the committed `dashboard_summary.json`, but Tab 2 needs
-  `models/xgboost_is_excluded.pkl` and `models/supervised_preprocessing.pkl`, and given the
-  previous point, retraining them produces a different model.
+  `models/xgboost_is_excluded.pkl` and `models/supervised_preprocessing.pkl`. Recreating the
+  model the app describes requires the commit above; training from `main` produces a
+  different one.
 
 ## How to run
 
@@ -177,11 +196,11 @@ step 1.
 python -m venv .venv
 # Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-pip install pyarrow   # needed by build_provider_features.py, not yet in requirements.txt
 ```
 
-The required Python version is in `requires-python` in `pyproject.toml`. Running the
-notebook also needs Jupyter, which is not in `requirements.txt`.
+The required Python version is in `requires-python` in `pyproject.toml`. The notebook runs
+on the `ipykernel` kernel included in `requirements.txt`; open it in VS Code or another
+Jupyter-compatible editor (the Jupyter Notebook and JupyterLab apps are not included).
 
 ### Pipeline order
 

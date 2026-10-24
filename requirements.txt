@@ -1,5 +1,6 @@
 pandas
 numpy
+pyarrow
 scikit-learn
 xgboost
 matplotlib
@@ -7,4 +8,5 @@ seaborn
 streamlit
 joblib
 requests
+ipykernel
 pytest
